@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 import numpy as np
@@ -46,9 +47,7 @@ class HDBSCANplus:
         randomState=7,
         debug=False,
         minClusterSizeRange=(3, 80),
-        minSamplesRange=(1, 80),
         clusterSelectionEpsilonRange=(0.0, 0.0),
-        neighborStepFrac=0.2,
         epsilonStep=0.05,
         dbcvGate=0.4,
         alpha=0.7,
@@ -56,7 +55,10 @@ class HDBSCANplus:
         singleClusterPenalty=0.4,
         tinyClusterPenaltyWeight=0.3,
         minUsefulClusterSize=4,
+        lambdaMax=1.0,
         bicVarEps=1e-6,
+        expandTopK=5,
+        kmeansMaxIter=20,
     ):
         self.metric = metric
         self.normalizeVectors = bool(normalizeVectors)
@@ -67,13 +69,11 @@ class HDBSCANplus:
         self.debug = bool(debug)
 
         self.minClusterSizeRange = (int(minClusterSizeRange[0]), int(minClusterSizeRange[1]))
-        self.minSamplesRange = (int(minSamplesRange[0]), int(minSamplesRange[1]))
         self.clusterSelectionEpsilonRange = (
             float(clusterSelectionEpsilonRange[0]),
             float(clusterSelectionEpsilonRange[1]),
         )
 
-        self.neighborStepFrac = float(max(0.05, neighborStepFrac))
         self.epsilonStep = float(max(0.0, epsilonStep))
 
         self.dbcvGate = float(max(0.0, min(1.0, dbcvGate)))
@@ -83,7 +83,11 @@ class HDBSCANplus:
         self.singleClusterPenalty = float(max(0.0, singleClusterPenalty))
         self.tinyClusterPenaltyWeight = float(max(0.0, tinyClusterPenaltyWeight))
         self.minUsefulClusterSize = int(max(2, minUsefulClusterSize))
+        self.lambdaMax = float(max(0.0, lambdaMax))
         self.bicVarEps = float(max(1e-12, bicVarEps))
+
+        self.expandTopK = int(max(1, expandTopK))
+        self.kmeansMaxIter = int(max(1, kmeansMaxIter))
 
         self.metricForRun = "euclidean"
         self.bestResult = None
@@ -141,10 +145,8 @@ class HDBSCANplus:
         if self.normalizeVectors:
             x = self._l2Normalize(x)
 
-        if self.metric == "cosine" and self.cosineViaNormalize:
-            self.metricForRun = "euclidean"
-        else:
-            self.metricForRun = self.metric
+        # Use euclidean for normalized embeddings.
+        self.metricForRun = "euclidean"
 
         return x
 
@@ -161,121 +163,122 @@ class HDBSCANplus:
         ranges = self._effectiveRanges(n)
 
         base = self._initialParamsForN(n, ranges)
-        frontier = self._initialFrontier(base, ranges)
-        visited = set()
-        tried = []
-        best = None
+        candidates = deque(self._initialFrontier(base, ranges))
+        tried = {}
+        expanded = set()
 
-        while frontier and len(tried) < self.maxTrials:
-            params = frontier.pop(0)
-            params = self._clampParams(params, ranges)
+        while candidates and len(tried) < self.maxTrials:
+            params = candidates.popleft()
             key = self._paramsKey(params)
-            if key in visited:
+            if key in tried:
                 continue
-            visited.add(key)
 
             trial = self.evaluateTrial(x, params)
-            tried.append(trial)
+            tried[key] = trial
 
-            if best is None or trial["score"] > best["score"]:
-                best = trial
-                neighbors = self._neighborParams(params, ranges)
-                for nb in neighbors:
-                    nb_key = self._paramsKey(nb)
-                    if nb_key not in visited:
-                        frontier.append(nb)
+            if len(tried) >= self.expandTopK or not candidates:
+                self._expandTopK(tried, expanded, candidates, ranges)
 
-        return best, tried
+        if not tried:
+            return None, []
+
+        best = min(tried.values(), key=self._rankSortKey)
+        return best, list(tried.values())
+
+    def _expandTopK(self, tried, expanded, candidates, ranges):
+        ranked = sorted(tried.items(), key=lambda kv: self._rankSortKey(kv[1]))
+        expanded_count = 0
+
+        for key, trial in ranked:
+            if key in expanded:
+                continue
+
+            expanded.add(key)
+            expanded_count += 1
+
+            neighbors = self._neighborParams(trial["params"], ranges)
+            for nb in neighbors:
+                nb_key = self._paramsKey(nb)
+                if nb_key not in tried:
+                    candidates.append(nb)
+
+            if expanded_count >= self.expandTopK:
+                break
+
+    def _rankSortKey(self, trial):
+        params = trial["params"]
+        return (-trial["score"], int(params["minClusterSize"]), float(params["clusterSelectionEpsilon"]))
 
     def _effectiveRanges(self, n):
         mcs_min, mcs_max = self.minClusterSizeRange
         mcs_max = min(mcs_max, n)
         mcs_min = min(mcs_min, mcs_max)
-
-        ms_min, ms_max = self.minSamplesRange
-        ms_max = min(ms_max, n)
-        ms_min = min(ms_min, ms_max)
+        mcs_min = max(2, mcs_min)
 
         eps_min, eps_max = self.clusterSelectionEpsilonRange
         eps_min = max(0.0, eps_min)
         eps_max = max(eps_min, eps_max)
 
-        return (mcs_min, mcs_max), (ms_min, ms_max), (eps_min, eps_max)
+        return (mcs_min, mcs_max), (eps_min, eps_max)
 
     def _initialParamsForN(self, n, ranges):
-        (mcs_min, mcs_max), (ms_min, ms_max), (eps_min, eps_max) = ranges
+        (mcs_min, mcs_max), (eps_min, eps_max) = ranges
         base = int(max(2, round(math.sqrt(n))))
         mcs = self._clampInt(base, (mcs_min, mcs_max))
-
-        ms = int(max(1, round(mcs / 2)))
-        ms = self._clampInt(ms, (ms_min, ms_max))
-        ms = min(ms, mcs)
-
         eps = self._clampFloat(0.0, (eps_min, eps_max))
-        return {"minClusterSize": mcs, "minSamples": ms, "clusterSelectionEpsilon": eps}
+        return {"minClusterSize": mcs, "clusterSelectionEpsilon": eps}
 
     def _initialFrontier(self, base, ranges):
-        (mcs_min, mcs_max), (ms_min, ms_max), (eps_min, eps_max) = ranges
+        (mcs_min, mcs_max), (eps_min, eps_max) = ranges
         mcs = int(base["minClusterSize"])
         eps = float(base["clusterSelectionEpsilon"])
 
         mcs_candidates = {
             self._clampInt(mcs, (mcs_min, mcs_max)),
-            self._clampInt(max(2, mcs // 2), (mcs_min, mcs_max)),
+            self._clampInt(max(2, int(round(mcs / 2))), (mcs_min, mcs_max)),
             self._clampInt(mcs * 2, (mcs_min, mcs_max)),
         }
 
         frontier = []
         for mcs_val in sorted(mcs_candidates):
-            ms_candidates = {1, max(1, mcs_val // 2), mcs_val}
-            for ms_val in sorted(ms_candidates):
-                ms_val = self._clampInt(ms_val, (ms_min, ms_max))
-                ms_val = min(ms_val, mcs_val)
-                params = {
-                    "minClusterSize": int(mcs_val),
-                    "minSamples": int(ms_val),
-                    "clusterSelectionEpsilon": float(self._clampFloat(eps, (eps_min, eps_max))),
-                }
-                frontier.append(params)
+            params = {
+                "minClusterSize": int(mcs_val),
+                "clusterSelectionEpsilon": float(self._clampFloat(eps, (eps_min, eps_max))),
+            }
+            frontier.append(params)
         return frontier
 
     def _neighborParams(self, params, ranges):
-        (mcs_min, mcs_max), (ms_min, ms_max), (eps_min, eps_max) = ranges
-
+        (mcs_min, mcs_max), (eps_min, eps_max) = ranges
         mcs = int(params["minClusterSize"])
-        ms = int(params["minSamples"])
         eps = float(params["clusterSelectionEpsilon"])
-
-        step_mcs = max(1, int(round(mcs * self.neighborStepFrac)))
-        step_ms = max(1, int(round(max(1, ms) * self.neighborStepFrac)))
 
         neighbors = []
 
-        for delta in (-step_mcs, step_mcs):
-            m_val = self._clampInt(mcs + delta, (mcs_min, mcs_max))
-            ms_val = min(ms, m_val)
-            ms_val = self._clampInt(ms_val, (ms_min, ms_max))
+        step_vals = [0.7, 0.9, 1.1, 1.3]
+        m_candidates = []
+        for step in step_vals:
+            m_val = int(round(mcs * step))
+            m_val = self._clampInt(m_val, (mcs_min, mcs_max))
+            if m_val != mcs:
+                m_candidates.append(m_val)
+
+        for m_val in sorted(set(m_candidates)):
             neighbors.append({
                 "minClusterSize": int(m_val),
-                "minSamples": int(ms_val),
-                "clusterSelectionEpsilon": float(self._clampFloat(eps, (eps_min, eps_max))),
-            })
-
-        for delta in (-step_ms, step_ms):
-            ms_val = self._clampInt(ms + delta, (ms_min, ms_max))
-            ms_val = min(ms_val, mcs)
-            neighbors.append({
-                "minClusterSize": int(mcs),
-                "minSamples": int(ms_val),
                 "clusterSelectionEpsilon": float(self._clampFloat(eps, (eps_min, eps_max))),
             })
 
         if eps_max > eps_min and self.epsilonStep > 0.0:
-            for delta in (-self.epsilonStep, self.epsilonStep):
-                e_val = self._clampFloat(eps + delta, (eps_min, eps_max))
+            e_candidates = [
+                self._clampFloat(eps - self.epsilonStep, (eps_min, eps_max)),
+                self._clampFloat(eps + self.epsilonStep, (eps_min, eps_max)),
+            ]
+            for e_val in sorted(set(e_candidates)):
+                if e_val == eps:
+                    continue
                 neighbors.append({
                     "minClusterSize": int(mcs),
-                    "minSamples": int(ms),
                     "clusterSelectionEpsilon": float(e_val),
                 })
 
@@ -285,15 +288,13 @@ class HDBSCANplus:
         eps = float(params["clusterSelectionEpsilon"])
         if self.epsilonStep > 0:
             eps = round(eps / self.epsilonStep) * self.epsilonStep
-        return (int(params["minClusterSize"]), int(params["minSamples"]), round(eps, 6))
+        return (int(params["minClusterSize"]), round(eps, 6))
 
     def _clampParams(self, params, ranges):
-        (mcs_min, mcs_max), (ms_min, ms_max), (eps_min, eps_max) = ranges
+        (mcs_min, mcs_max), (eps_min, eps_max) = ranges
         mcs = self._clampInt(params["minClusterSize"], (mcs_min, mcs_max))
-        ms = self._clampInt(params["minSamples"], (ms_min, ms_max))
-        ms = min(ms, mcs)
         eps = self._clampFloat(params["clusterSelectionEpsilon"], (eps_min, eps_max))
-        return {"minClusterSize": int(mcs), "minSamples": int(ms), "clusterSelectionEpsilon": float(eps)}
+        return {"minClusterSize": int(mcs), "clusterSelectionEpsilon": float(eps)}
 
     def _clampInt(self, val, rng):
         return int(max(rng[0], min(rng[1], int(val))))
@@ -303,8 +304,7 @@ class HDBSCANplus:
 
     def _defaultParamsForSmallN(self, n):
         mcs = max(2, min(5, int(n)))
-        ms = max(1, min(mcs, int(n)))
-        return {"minClusterSize": mcs, "minSamples": ms, "clusterSelectionEpsilon": 0.0}
+        return {"minClusterSize": mcs, "clusterSelectionEpsilon": 0.0}
 
     # ----------------------- trial evaluation -----------------------
 
@@ -320,13 +320,17 @@ class HDBSCANplus:
             return {
                 "params": dict(params),
                 "score": -1.0,
+                "baseScore": -1.0,
                 "dbcvRaw": -1.0,
                 "dbcvNorm": 0.0,
                 "bicRaw": -1.0,
                 "bicNull": -1.0,
                 "bicScore": 0.0,
-                "penalty": 1.0,
+                "sanityPenalty": 1.0,
+                "mixedPenalty": 0.0,
+                "mixedLambda": 0.0,
                 "penaltyDetails": {},
+                "mixedDetails": {},
                 "gate": "error",
                 "alpha": self.alpha,
                 "stats": stats,
@@ -340,19 +344,27 @@ class HDBSCANplus:
         dbcvNorm = self._normalizeDbcv(dbcvRaw)
         bicScore, bicRaw, bicNull = self._bicScore(x, labels)
 
-        penalty, penaltyDetails = self._penalty(stats)
-        score, gate, alpha = self._blendScore(dbcvNorm, bicScore, penalty)
+        baseScore, gate, alpha = self._baseScore(dbcvNorm, bicScore)
+        sanityPenalty, penaltyDetails = self._penalty(stats)
+        mixedPenalty, mixedDetails = self._mixedPenalty(x, labels, params["minClusterSize"])
+        mixedLambda = self.lambdaMax * dbcvNorm
+
+        score = baseScore - sanityPenalty - (mixedLambda * mixedPenalty)
 
         return {
             "params": dict(params),
             "score": float(score),
+            "baseScore": float(baseScore),
             "dbcvRaw": float(dbcvRaw),
             "dbcvNorm": float(dbcvNorm),
             "bicRaw": float(bicRaw),
             "bicNull": float(bicNull),
             "bicScore": float(bicScore),
-            "penalty": float(penalty),
+            "sanityPenalty": float(sanityPenalty),
+            "mixedPenalty": float(mixedPenalty),
+            "mixedLambda": float(mixedLambda),
             "penaltyDetails": penaltyDetails,
+            "mixedDetails": mixedDetails,
             "gate": gate,
             "alpha": float(alpha),
             "stats": stats,
@@ -363,7 +375,7 @@ class HDBSCANplus:
     def _runHdbscan(self, x, params):
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=int(params["minClusterSize"]),
-            min_samples=int(params["minSamples"]),
+            min_samples=None,
             metric=self.metricForRun,
             cluster_selection_epsilon=float(params.get("clusterSelectionEpsilon", 0.0)),
             cluster_selection_method=self.clusterSelectionMethod,
@@ -495,12 +507,96 @@ class HDBSCANplus:
             "tinyClusters": self.tinyClusterPenaltyWeight * tinyFrac,
         }
 
-    def _blendScore(self, dbcvNorm, bicScore, penalty):
+    def _baseScore(self, dbcvNorm, bicScore):
         if dbcvNorm < self.dbcvGate:
-            return dbcvNorm - penalty, "dbcv_only", 1.0
+            return dbcvNorm, "dbcv_only", 1.0
 
-        score = self.alpha * dbcvNorm + (1.0 - self.alpha) * bicScore - penalty
+        score = self.alpha * dbcvNorm + (1.0 - self.alpha) * bicScore
         return score, "blend", self.alpha
+
+    def _mixedPenalty(self, x, labels, minClusterSize):
+        labels = np.asarray(labels)
+        n = int(labels.shape[0])
+        if n == 0:
+            return 0.0, {"skipped": True, "reason": "empty"}
+
+        real_labels = [l for l in sorted(set(labels.tolist())) if l != -1]
+        if len(real_labels) < 2:
+            return 0.0, {"skipped": True, "reason": "too_few_clusters"}
+
+        m = max(1, int(minClusterSize))
+        total = 0.0
+
+        for lab in real_labels:
+            idx = np.where(labels == lab)[0]
+            if idx.size < 2:
+                continue
+
+            pts = x[idx]
+            spread_before = self._clusterSpread(pts)
+            if spread_before <= 0.0:
+                continue
+
+            split_labels = self._kmeans2Labels(pts)
+            pts0 = pts[split_labels == 0]
+            pts1 = pts[split_labels == 1]
+            if pts0.size == 0 or pts1.size == 0:
+                continue
+
+            spread0 = self._clusterSpread(pts0)
+            spread1 = self._clusterSpread(pts1)
+            spread_after = (pts0.shape[0] * spread0 + pts1.shape[0] * spread1) / float(idx.size)
+
+            improvement = (spread_before - spread_after) / spread_before
+            improvement = max(0.0, min(1.0, float(improvement)))
+
+            r = float(idx.size) / float(m)
+            size_weight = r / (1.0 + r)
+
+            mixed_penalty_cluster = improvement * size_weight
+            total += idx.size * mixed_penalty_cluster
+
+        total_penalty = total / float(n)
+        return float(total_penalty), {"skipped": False}
+
+    def _clusterSpread(self, pts):
+        if pts.size == 0:
+            return 0.0
+        if pts.shape[0] <= 1:
+            return 0.0
+        centroid = pts.mean(axis=0)
+        dists = np.linalg.norm(pts - centroid, axis=1)
+        return float(np.mean(dists))
+
+    def _kmeans2Labels(self, pts):
+        n = int(pts.shape[0])
+        if n <= 1:
+            return np.zeros(n, dtype=np.int32)
+
+        c0 = pts[0]
+        dists = np.linalg.norm(pts - c0, axis=1)
+        idx1 = int(np.argmax(dists))
+        c1 = pts[idx1]
+
+        labels = None
+        for _ in range(self.kmeansMaxIter):
+            d0 = np.sum((pts - c0) ** 2, axis=1)
+            d1 = np.sum((pts - c1) ** 2, axis=1)
+            new_labels = (d1 < d0).astype(np.int32)
+
+            if labels is not None and np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+
+            if np.all(labels == 0) or np.all(labels == 1):
+                break
+
+            c0 = pts[labels == 0].mean(axis=0)
+            c1 = pts[labels == 1].mean(axis=0)
+
+        if labels is None:
+            labels = np.zeros(n, dtype=np.int32)
+        return labels
 
     # ----------------------- result packaging -----------------------
 
@@ -515,13 +611,17 @@ class HDBSCANplus:
         stats = best.get("stats", {})
         scoreDetails = {
             "score": float(best.get("score", -1.0)),
+            "baseScore": float(best.get("baseScore", -1.0)),
             "dbcvRaw": float(best.get("dbcvRaw", -1.0)),
             "dbcvNorm": float(best.get("dbcvNorm", 0.0)),
             "bicRaw": float(best.get("bicRaw", -1.0)),
             "bicNull": float(best.get("bicNull", -1.0)),
             "bicScore": float(best.get("bicScore", 0.0)),
-            "penalty": float(best.get("penalty", 0.0)),
+            "sanityPenalty": float(best.get("sanityPenalty", 0.0)),
+            "mixedPenalty": float(best.get("mixedPenalty", 0.0)),
+            "mixedLambda": float(best.get("mixedLambda", 0.0)),
             "penaltyDetails": best.get("penaltyDetails", {}),
+            "mixedDetails": best.get("mixedDetails", {}),
             "gate": best.get("gate", ""),
             "alpha": float(best.get("alpha", self.alpha)),
             "error": best.get("error", ""),
@@ -529,6 +629,7 @@ class HDBSCANplus:
 
         clusterStats = dict(stats)
         bestParams = dict(best.get("params", {}))
+        bestParams["minSamples"] = "default"
         bestScore = float(best.get("score", -1.0))
 
         return HdbscanPlusResult(
